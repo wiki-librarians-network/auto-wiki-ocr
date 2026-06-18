@@ -1,0 +1,377 @@
+// ==UserScript==
+// @name         ML Wikisource – Google OCR Automator v5
+// @namespace    https://ml.wikisource.org/
+// @version      5.0
+// @description  Sets Google OCR + Malayalam lang, intercepts OCR API to strip watermarks before text reaches the editor, auto-triggers OCR, and provides page navigation.
+// @author       Thrissur Kole Project
+// @match        https://ml.wikisource.org/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        unsafeWindow
+// @run-at       document-start
+// ==/UserScript==
+
+/* ─────────────────────────────────────────────────────────────────
+   WATERMARK PATTERNS
+   Each is serialised into the injected page script so they run
+   inside the real window context where fetch/jQuery live.
+───────────────────────────────────────────────────────────────── */
+const PATTERNS = [
+  { s: 'Digitized\\s+[Bb]y\\s+Kerala\\s+Sahitya\\s+Akademi[^\\n]*', f: 'g'  },
+  { s: 'Kerala\\s+Sahitya\\s+Akademi\\s+[Dd]igitized[^\\n]*',       f: 'g'  },
+  { s: 'Kerala\\s+Sahitya\\s+Akademi',                               f: 'g'  },
+  { s: 'Sahitya\\s+Akademi',                                         f: 'g'  },
+  { s: '[Dd]igitized\\s+[Bb]y\\s+KSA[^\\n]*',                       f: 'g'  },
+  { s: '^[Dd]igitized\\s+[Bb]y[^\\n]*\\n?',                         f: 'gm' },
+  { s: '^_+\\s*$',                                                    f: 'gm' },
+];
+
+/* ─────────────────────────────────────────────────────────────────
+   STEP 0 – inject network interceptors INTO PAGE CONTEXT
+   (Tampermonkey sandbox can't reach window.fetch or window.jQuery,
+    but an injected <script> runs in the real page context and can.)
+───────────────────────────────────────────────────────────────── */
+function injectInterceptor() {
+  const script = document.createElement('script');
+  script.id = '_oat_interceptor';
+  script.textContent = /* js */ `(function () {
+  if (window._OAT_READY) return;
+  window._OAT_READY = true;
+
+  /* patterns passed from Tampermonkey */
+  const PATS = ${JSON.stringify(PATTERNS)};
+
+  function clean(text) {
+    if (typeof text !== 'string') return text;
+    let s = text;
+    for (const {s: src, f: flags} of PATS) {
+      try { s = s.replace(new RegExp(src, flags), ''); } catch (_) {}
+    }
+    return s.replace(/\\n{3,}/g, '\\n\\n').trim();
+  }
+
+  function patchData(data) {
+    if (!data) return data;
+    let obj = data;
+    if (typeof obj === 'string') { try { obj = JSON.parse(obj); } catch (_) {} }
+    if (obj && typeof obj === 'object') {
+      if (typeof obj.text   === 'string') obj.text   = clean(obj.text);
+      if (typeof obj.result === 'string') obj.result = clean(obj.result);
+    }
+    return obj;
+  }
+
+  /* ── patch window.fetch ───────────────────────────────────── */
+  const _fetch = window.fetch;
+  window.fetch = async function (url) {
+    const resp = await _fetch.apply(this, arguments);
+    const u = String(url);
+    if (u.includes('ocr.wmcloud.org') || u.includes('/ocr')) {
+      try {
+        const raw  = await resp.clone().text();
+        const data = patchData(raw);
+        const body = typeof data === 'object' ? JSON.stringify(data) : data;
+        const hdrs = {};
+        resp.headers.forEach((v, k) => { hdrs[k] = v; });
+        return new Response(body, { status: resp.status, statusText: resp.statusText, headers: hdrs });
+      } catch (_) {}
+    }
+    return resp;
+  };
+
+  /* ── patch jQuery.ajax (used by old GoogleOcr gadget) ────── */
+  function patchJQ() {
+    const jq = window.jQuery || window.$;
+    if (!jq || !jq.ajax || jq.__oat_patched) return;
+    jq.__oat_patched = true;
+    const _ajax = jq.ajax;
+    jq.ajax = function (url, cfg) {
+      const opt = (typeof url === 'object') ? url : Object.assign({ url }, cfg || {});
+      if (opt.url && String(opt.url).includes('ocr')) {
+        const orig = opt.success;
+        opt.success = function (data, status, xhr) {
+          data = patchData(data);
+          if (orig) orig.call(this, data, status, xhr);
+        };
+      }
+      return (typeof url === 'object') ? _ajax.call(this, opt) : _ajax.call(this, opt.url, opt);
+    };
+    console.log('[OAT] jQuery.ajax patched for OCR');
+  }
+
+  /* jQuery may not be loaded yet at document-start */
+  patchJQ();
+  document.addEventListener('DOMContentLoaded', patchJQ);
+  setTimeout(patchJQ, 500);
+  setTimeout(patchJQ, 2000);
+
+  console.log('[OAT] fetch interceptor installed');
+})();`;
+  (document.head || document.documentElement).appendChild(script);
+  script.remove();
+}
+
+/* Inject immediately (script runs at document-start) */
+injectInterceptor();
+
+/* ─────────────────────────────────────────────────────────────────
+   Everything below runs after the DOM is ready
+───────────────────────────────────────────────────────────────── */
+(function main() {
+  'use strict';
+
+  /* ── URL helpers ───────────────────────────────────────────── */
+  function getTitle() {
+    const t = new URL(location.href).searchParams.get('title');
+    if (t) return decodeURIComponent(t);
+    const m = location.pathname.match(/\/wiki\/(.+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+  const isPageEdit  = () => new URL(location.href).searchParams.get('action') === 'edit'
+                         && /^താൾ:/.test(getTitle());
+  const isIndexPage = () => /^സൂചിക:/.test(getTitle());
+
+  function parseTitle(t) {
+    const m = t.match(/^താൾ:(.+?)\/(\d+)$/);
+    return m ? { book: m[1], pageNum: +m[2] } : null;
+  }
+  const editUrl = (book, n) =>
+    `https://ml.wikisource.org/w/index.php?title=${
+      encodeURIComponent('താൾ:' + book + '/' + n)}&action=edit&redlink=1`;
+
+  /* ── Set Google OCR + Malayalam as persistent preference ───── */
+  function setGoogleMLPreference() {
+    const OCR_PREF = JSON.stringify({ engine: 'google', langs: ['ml'], showOnboarding: false });
+
+    /* 1. Set in memory immediately (picked up by the widget on next render) */
+    try {
+      const mw = unsafeWindow.mw;
+      if (mw && mw.user && mw.user.options) {
+        mw.user.options.set('wikisource-ocr', OCR_PREF);
+      }
+    } catch (_) {}
+
+    /* 2. Flip the engine radio in the widget DOM */
+    const r = document.querySelector('.ext-wikisource-ocr-engineradios input[value="google"]');
+    if (r && !r.checked) { r.checked = true; r.dispatchEvent(new Event('change', { bubbles: true })); }
+
+    /* 3. Persist via MW API so it survives page reloads */
+    try {
+      const mw = unsafeWindow.mw;
+      if (mw && mw.Api) {
+        new mw.Api().saveOption('wikisource-ocr', OCR_PREF).then(() => {
+          console.log('[OAT] wikisource-ocr preference saved (google + ml)');
+        });
+      }
+    } catch (_) {}
+  }
+
+  /* ── Trigger OCR ───────────────────────────────────────────── */
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  async function triggerOCR() {
+    /* Priority A: direct Google OCR gadget button */
+    const gadget = document.querySelector('a[rel="GoogleOcr"]');
+    if (gadget) { gadget.click(); return 'Google gadget'; }
+
+    /* Priority B: ext-wikisource OCR widget – ensure Google is selected, then click */
+    const cfgBtn = document.querySelector(
+      '.oo-ui-popupButtonWidget a[aria-haspopup="dialog"],' +
+      '#ooui-7 a.oo-ui-buttonElement-button');
+    if (cfgBtn) {
+      cfgBtn.click(); await delay(500);
+      const gr = document.querySelector('.ext-wikisource-ocr-engineradios input[value="google"]');
+      if (gr && !gr.checked) { gr.click(); gr.dispatchEvent(new Event('change', { bubbles: true })); }
+      await delay(400); cfgBtn.click(); await delay(300);
+    }
+
+    return await new Promise((res, rej) => {
+      let elapsed = 0;
+      const t = setInterval(() => {
+        const btn =
+          document.querySelector('.ext-wikisource-ExtractTextWidget .oo-ui-buttonElement-button[title*="OCR"]') ||
+          document.querySelector('.ext-wikisource-ExtractTextWidget .oo-ui-buttonWidget:first-child .oo-ui-buttonElement-button');
+        if (btn) { clearInterval(t); btn.click(); res('OCR widget'); return; }
+        if ((elapsed += 300) > 15000) { clearInterval(t); rej(new Error('OCR button not found')); }
+      }, 300);
+    });
+  }
+
+  /* ── Fetch total pages via API ─────────────────────────────── */
+  async function fetchTotal(book) {
+    try {
+      const d = await (await fetch(
+        `https://ml.wikisource.org/w/api.php?action=query&titles=${
+          encodeURIComponent('സൂചിക:' + book)}&prop=pageprops|revisions&rvprop=content&format=json&origin=*`
+      )).json();
+      const pg = Object.values(d.query.pages)[0];
+      if (pg.pageprops?.proofread_page_numbers) return +pg.pageprops.proofread_page_numbers;
+      const wt = pg?.revisions?.[0]?.['*'] || pg?.revisions?.[0]?.content || '';
+      const nums = [...wt.matchAll(/\/(\d+)/g)].map(x => +x[1]);
+      const m = wt.match(/to\s*=\s*(\d+)/i);
+      if (m) nums.push(+m[1]);
+      return nums.length ? Math.max(...nums) : null;
+    } catch (_) { return null; }
+  }
+
+  /* ── Status helper ─────────────────────────────────────────── */
+  function setStatus(msg, color = '#93c5fd') {
+    const el = document.getElementById('oat-st');
+    if (el) { el.textContent = msg; el.style.color = color; }
+  }
+
+  /* ── Save button helper ────────────────────────────────────── */
+  function findSaveBtn() {
+    return document.getElementById('wpSave')
+      || document.querySelector('button[name="wpSave"],input[name="wpSave"]')
+      || [...document.querySelectorAll('button,input[type="submit"]')]
+           .find(b => /save|publish|സൃഷ്ടി/i.test(b.textContent + b.value));
+  }
+
+  /* ── Panel ─────────────────────────────────────────────────── */
+  const S = bg => `background:${bg};color:#fff;border:none;border-radius:5px;padding:4px 9px;cursor:pointer;font-size:12px;white-space:nowrap`;
+
+  function buildPanel(info, total) {
+    document.getElementById('oat-panel')?.remove();
+    const p = document.createElement('div');
+    p.id = 'oat-panel';
+    p.style.cssText = 'position:fixed;top:58px;right:14px;z-index:99999;'
+      + 'background:#111827;color:#e5e7eb;border:1px solid #3b82f6;border-radius:10px;'
+      + 'padding:12px 14px;font-family:sans-serif;font-size:13px;min-width:218px;'
+      + 'box-shadow:0 6px 28px rgba(0,0,0,.6);line-height:1.7;';
+
+    const pct = total ? Math.round((info.pageNum / total) * 100) : 0;
+    const bar = total
+      ? `<div style="margin:4px 0 3px;background:#374151;border-radius:3px;height:5px">
+           <div style="width:${pct}%;background:#3b82f6;height:5px;border-radius:3px"></div></div>` : '';
+
+    p.innerHTML = `
+      <div style="font-weight:700;font-size:14px;margin-bottom:4px;color:#60a5fa">📄 OCR Automator</div>
+      <div style="color:#9ca3af;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px"
+           title="${info.book}">${info.book}</div>
+      <div><b>Page:</b> ${info.pageNum} / ${total || '?'}</div>
+      ${bar}
+      <div id="oat-st" style="margin:6px 0 4px;color:#93c5fd;font-size:12px">⏳ Setting up…</div>
+
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px">
+        <button id="oat-prev" style="${S('#4b5563')}">◀ Prev</button>
+        <button id="oat-next" style="${S('#1d4ed8')}">Next ▶</button>
+        <button id="oat-sn"   style="${S('#065f46')}">💾 Save &amp; Next</button>
+      </div>
+      <div style="display:flex;gap:5px;align-items:center;margin-top:7px;flex-wrap:wrap">
+        <input id="oat-j" type="number" min="1" max="${total || 9999}" value="${info.pageNum}"
+          style="width:50px;padding:3px 5px;border-radius:5px;border:1px solid #4b5563;
+                 background:#1f2937;color:#e5e7eb;font-size:12px">
+        <button id="oat-go"    style="${S('#4b5563')}">Go</button>
+        <button id="oat-rerun" style="${S('#7c3aed')}">🔄 Re-OCR</button>
+      </div>
+      <div style="margin-top:9px;font-size:11px">
+        <a href="https://ml.wikisource.org/wiki/${encodeURIComponent('സൂചിക:' + info.book)}"
+           style="color:#60a5fa" target="_blank">↗ Index</a>
+        &nbsp;|&nbsp;
+        <span style="color:#6b7280;font-size:10px">Google OCR · ml</span>
+      </div>`;
+
+    document.body.appendChild(p);
+
+    const G = id => document.getElementById(id);
+    if (info.pageNum <= 1) G('oat-prev').disabled = true;
+    if (total && info.pageNum >= total) { G('oat-next').disabled = true; G('oat-sn').disabled = true; }
+
+    G('oat-prev').onclick = () => location.href = editUrl(info.book, info.pageNum - 1);
+    G('oat-next').onclick = () => location.href = editUrl(info.book, info.pageNum + 1);
+    G('oat-j').addEventListener('keydown', e => e.key === 'Enter' && G('oat-go').click());
+    G('oat-go').onclick = () => { const n = +G('oat-j').value; if (n > 0) location.href = editUrl(info.book, n); };
+
+    G('oat-rerun').onclick = async () => {
+      setStatus('⏳ Re-triggering OCR…');
+      setGoogleMLPreference();
+      try { const m = await triggerOCR(); setStatus('⏳ OCR running (' + m + ')…'); }
+      catch (e) { setStatus('⚠️ No OCR button found', '#fb923c'); }
+    };
+
+    G('oat-sn').onclick = () => {
+      const btn = findSaveBtn();
+      if (btn) {
+        GM_setValue('oat_goto', JSON.stringify({ book: info.book, next: info.pageNum + 1 }));
+        btn.click();
+      } else {
+        setStatus('⚠️ Save button not found', '#fb923c');
+      }
+    };
+  }
+
+  /* ── Post-save redirect ────────────────────────────────────── */
+  function checkRedirect() {
+    const raw = GM_getValue('oat_goto', null);
+    if (!raw) return;
+    if (new URL(location.href).searchParams.get('action') === 'edit') return;
+    const title = getTitle();
+    if (!/^താൾ:/.test(title)) return;
+    const { book, next } = JSON.parse(raw);
+    if (!title.includes(book)) return;
+    GM_setValue('oat_goto', null);
+    setTimeout(() => { location.href = editUrl(book, next); }, 600);
+  }
+
+  /* ── Index page banner ─────────────────────────────────────── */
+  function handleIndex() {
+    const book = getTitle().replace(/^സൂചിക:/, '');
+    const d = document.createElement('div');
+    d.style.cssText = 'background:#111827;color:#e5e7eb;border:1px solid #3b82f6;'
+      + 'border-radius:8px;padding:10px 14px;margin:10px 0;font-size:13px;font-family:sans-serif;';
+    d.innerHTML = `<b style="color:#60a5fa">📄 Google OCR Automator (ml)</b> — from page:
+      <input id="oat-s" type="number" value="1" min="1"
+        style="width:55px;margin:0 7px;padding:3px 5px;border-radius:5px;
+               border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">
+      <button id="oat-b" style="${S('#1d4ed8')}">Begin ▶</button>
+      <span style="font-size:11px;color:#6b7280;margin-left:8px">
+        Google OCR · Malayalam · watermarks auto-removed
+      </span>`;
+    const c = document.getElementById('mw-content-text') || document.getElementById('content');
+    if (c) c.insertBefore(d, c.firstChild);
+    document.getElementById('oat-b').onclick = () => {
+      const n = +document.getElementById('oat-s').value;
+      if (n > 0) location.href = editUrl(book, n);
+    };
+  }
+
+  /* ── MAIN (wait for DOM) ───────────────────────────────────── */
+  function run() {
+    if (isIndexPage()) { handleIndex(); return; }
+
+    if (isPageEdit()) {
+      const info = parseTitle(getTitle());
+      if (!info) return;
+
+      (async () => {
+        /* Set Google+ml preference ASAP */
+        setGoogleMLPreference();
+
+        const total = await fetchTotal(info.book);
+        buildPanel(info, total);
+        setStatus('⏳ Triggering Google OCR (ml)…');
+
+        try {
+          /* Small delay so MW modules finish loading */
+          await delay(1800);
+          setGoogleMLPreference(); /* call again after modules load */
+          const method = await triggerOCR();
+          setStatus(`✅ OCR running via ${method} — watermarks will be stripped`, '#aefaae');
+        } catch (e) {
+          setStatus('⚠️ Click OCR manually — watermarks still intercepted', '#fb923c');
+        }
+      })();
+      return;
+    }
+
+    checkRedirect();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run);
+  } else {
+    run();
+  }
+
+})();
