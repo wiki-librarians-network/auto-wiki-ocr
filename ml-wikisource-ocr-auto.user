@@ -3,7 +3,7 @@
 // @namespace    https://ml.wikisource.org/
 // @version      5.0
 // @description  Sets Google OCR + Malayalam lang, intercepts OCR API to strip watermarks before text reaches the editor, auto-triggers OCR, and provides page navigation.
-// @author       Thrissur Kole Project
+// @author       Manoj K
 // @match        https://ml.wikisource.org/*
 // @grant        GM_setValue
 // @grant        GM_getValue
